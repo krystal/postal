@@ -18,11 +18,13 @@
 #  route_id      :integer
 #  manual        :boolean          default(FALSE)
 #  batch_key     :string(255)
+#  priority      :integer          default(50), not null
 #
 # Indexes
 #
 #  index_queued_messages_on_domain      (domain)
 #  index_queued_messages_on_message_id  (message_id)
+#  index_queued_messages_on_priority    (priority)
 #  index_queued_messages_on_server_id   (server_id)
 #
 
@@ -35,6 +37,7 @@ class QueuedMessage < ApplicationRecord
   belongs_to :ip_address, optional: true
 
   before_create :allocate_ip_address
+  before_create :copy_priority_from_server
 
   scope :ready_with_delayed_retry, -> { where("retry_after IS NULL OR retry_after < ?", 30.seconds.ago) }
   scope :with_stale_lock, -> { where("locked_at IS NOT NULL AND locked_at < ?", Postal::Config.postal.queued_message_lock_stale_days.days.ago) }
@@ -69,9 +72,18 @@ class QueuedMessage < ApplicationRecord
     else
       time = Time.now
       locker = Postal.locker_name
-      self.class.ready.where(batch_key: batch_key, ip_address_id: ip_address_id, locked_by: nil, locked_at: nil).limit(limit).update_all(locked_by: locker, locked_at: time)
+      # Lock by ID: an UPDATE scanning the priority index deadlocks with workers deleting finished messages
+      ids = self.class.ready.where(batch_key: batch_key, ip_address_id: ip_address_id, priority: priority, locked_by: nil, locked_at: nil).limit(limit).pluck(:id)
+      self.class.ready.where(id: ids, locked_by: nil, locked_at: nil).update_all(locked_by: locker, locked_at: time)
       QueuedMessage.where(batch_key: batch_key, ip_address_id: ip_address_id, locked_by: locker, locked_at: time).where.not(id: id)
     end
+  end
+
+  private
+
+  # Copied so the queue can be ordered by priority without joining to servers
+  def copy_priority_from_server
+    self.priority = server.priority
   end
 
 end

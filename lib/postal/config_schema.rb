@@ -143,6 +143,12 @@ module Postal
         description "The number of threads to execute within each worker"
         default 2
       end
+
+      integer :minimum_priority do
+        description "The lowest server priority that this worker will send queued messages for. " \
+                    "Messages from servers with a lower priority are left for other workers."
+        default 0
+      end
     end
 
     group :main_db do

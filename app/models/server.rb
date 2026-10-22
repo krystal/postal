@@ -15,6 +15,7 @@
 #  outbound_spam_threshold            :decimal(8, 2)
 #  permalink                          :string(255)
 #  postmaster_address                 :string(255)
+#  priority                           :integer          default(50), not null
 #  privacy_mode                       :boolean          default(FALSE)
 #  raw_message_retention_days         :integer
 #  raw_message_retention_size         :integer
@@ -77,6 +78,7 @@ class Server < ApplicationRecord
   validates :name, presence: true, uniqueness: { scope: :organization_id, case_sensitive: false }
   validates :mode, inclusion: { in: MODES }
   validates :permalink, presence: true, uniqueness: { scope: :organization_id, case_sensitive: false }, format: { with: /\A[a-z0-9-]*\z/ }, exclusion: { in: RESERVED_PERMALINKS }
+  validates :priority, numericality: { greater_than_or_equal_to: 0, less_than_or_equal_to: 100, only_integer: true }
   validate :validate_ip_pool_belongs_to_organization
 
   before_validation(on: :create) do
@@ -94,6 +96,8 @@ class Server < ApplicationRecord
       message_db.provisioner.drop
     end
   end
+
+  after_commit :copy_priority_to_queued_messages, on: :update, if: :saved_change_to_priority?
 
   def status
     if suspended?
@@ -303,6 +307,11 @@ class Server < ApplicationRecord
     return unless ip_pool && ip_pool_id_changed? && !organization.ip_pools.include?(ip_pool)
 
     errors.add :ip_pool_id, "must belong to the organization"
+  end
+
+  # Messages queued while this runs may keep the old priority
+  def copy_priority_to_queued_messages
+    queued_messages.where.not(priority: priority).in_batches(of: 1000).update_all(priority: priority)
   end
 
   class << self

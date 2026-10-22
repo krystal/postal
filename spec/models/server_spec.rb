@@ -15,6 +15,7 @@
 #  outbound_spam_threshold            :decimal(8, 2)
 #  permalink                          :string(255)
 #  postmaster_address                 :string(255)
+#  priority                           :integer          default(50), not null
 #  privacy_mode                       :boolean          default(FALSE)
 #  raw_message_retention_days         :integer
 #  raw_message_retention_size         :integer
@@ -76,6 +77,7 @@ describe Server do
     it { is_expected.not_to allow_value("hello+").for(:permalink) }
     it { is_expected.not_to allow_value("!!!").for(:permalink) }
     it { is_expected.not_to allow_value("[hello]").for(:permalink) }
+    it { is_expected.to validate_numericality_of(:priority).only_integer.is_greater_than_or_equal_to(0).is_less_than_or_equal_to(100) }
 
     describe "ip pool validation" do
       let(:org) { create(:organization) }
@@ -116,6 +118,25 @@ describe Server do
       expect(server.message_db.provisioner).to receive(:provision).once
       server.provision_database = true
       server.save
+    end
+  end
+
+  describe "changing the priority" do
+    let(:server) { create(:server) }
+
+    it "copies the new priority to the server's queued messages" do
+      queued_message = create(:queued_message, server: server)
+      other_queued_message = create(:queued_message)
+      server.update!(priority: 100)
+      expect(queued_message.reload.priority).to eq 100
+      expect(other_queued_message.reload.priority).to eq 50
+    end
+
+    it "does not change queued messages when the priority has not changed" do
+      queued_message = create(:queued_message, server: server)
+      queued_message.update_column(:priority, 10)
+      server.update!(name: "Renamed Server")
+      expect(queued_message.reload.priority).to eq 10
     end
   end
 
