@@ -35,6 +35,29 @@ module Postal
         @database.delete("suppressions", where: { keep_until: { less_than: Time.now.to_f } }) || 0
       end
 
+      # Copy unexpired suppressions from another list. An existing suppression for the same
+      # type and address is only extended if the copied one expires later, so it is safe to re-run.
+      def copy_from(other)
+        counts = { added: 0, extended: 0, unchanged: 0 }
+        other.unexpired.each do |suppression|
+          existing = @database.select("suppressions", where: { type: suppression["type"], address: suppression["address"] }, limit: 1).first
+          if existing.nil?
+            @database.insert("suppressions", suppression.slice("type", "address", "reason", "timestamp", "keep_until"))
+            counts[:added] += 1
+          elsif existing["keep_until"].nil? || existing["keep_until"] < suppression["keep_until"]
+            @database.update("suppressions", { reason: suppression["reason"] || existing["reason"], keep_until: suppression["keep_until"] }, where: { id: existing["id"] })
+            counts[:extended] += 1
+          else
+            counts[:unchanged] += 1
+          end
+        end
+        counts
+      end
+
+      def unexpired
+        @database.select("suppressions", where: { keep_until: { greater_than_or_equal_to: Time.now.to_f } }, order: :id)
+      end
+
     end
   end
 end

@@ -26,6 +26,21 @@ namespace :postal do
     puts Postal::HelmConfigExporter.new(Postal::ConfigSchema).export
   end
 
+  desc "Copy unexpired suppressions from one server to another"
+  task :copy_suppressions, [:from_server_id, :to_server_id] => :environment do |_, args|
+    if args[:from_server_id].blank? || args[:to_server_id].blank?
+      abort "Usage: rake postal:copy_suppressions[from_server_id,to_server_id]"
+    end
+
+    from = Server.find(args[:from_server_id])
+    to = Server.find(args[:to_server_id])
+    abort "The source and destination servers must be different" if from == to
+
+    counts = to.message_db.suppression_list.copy_from(from.message_db.suppression_list)
+    puts "Copied suppressions from #{from.full_permalink} (ID: #{from.id}) to #{to.full_permalink} (ID: #{to.id})"
+    puts "#{counts[:added]} added, #{counts[:extended]} extended, #{counts[:unchanged]} already present"
+  end
+
   desc "Update the database"
   task update: :environment do
     mysql = ActiveRecord::Base.connection
