@@ -11,6 +11,7 @@
 #  locked_at     :datetime
 #  locked_by     :string(255)
 #  manual        :boolean          default(FALSE)
+#  priority      :integer          default(50), not null
 #  retry_after   :datetime
 #  created_at    :datetime
 #  updated_at    :datetime
@@ -23,6 +24,7 @@
 #
 #  index_queued_messages_on_domain      (domain)
 #  index_queued_messages_on_message_id  (message_id)
+#  index_queued_messages_on_priority    (priority)
 #  index_queued_messages_on_server_id   (server_id)
 #
 require "rails_helper"
@@ -33,6 +35,20 @@ RSpec.describe QueuedMessage do
   describe "relationships" do
     it { is_expected.to belong_to(:server) }
     it { is_expected.to belong_to(:ip_address).optional }
+  end
+
+  describe "creation" do
+    let(:server) { create(:server, priority: 80) }
+
+    it "copies the priority from the server" do
+      queued_message = create(:queued_message, server: server)
+      expect(queued_message.reload.priority).to eq 80
+    end
+
+    it "uses the server's priority in place of any priority given" do
+      queued_message = create(:queued_message, server: server, priority: 10)
+      expect(queued_message.reload.priority).to eq 80
+    end
   end
 
   describe ".ready_with_delayed_retry" do
@@ -214,6 +230,12 @@ RSpec.describe QueuedMessage do
 
         it "does not find messages that are for a different IP address" do
           create(:queued_message, batch_key: batch_key, ip_address: create(:ip_address))
+          expect(queued_message.batchable_messages).to eq []
+        end
+
+        it "does not find messages with a different priority" do
+          create(:queued_message, batch_key: batch_key, ip_address: nil, server: create(:server, priority: 100))
+          create(:queued_message, batch_key: batch_key, ip_address: nil, server: create(:server, priority: 0))
           expect(queued_message.batchable_messages).to eq []
         end
       end
