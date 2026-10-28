@@ -81,9 +81,10 @@ class QueuedMessage < ApplicationRecord
 
   private
 
-  # Copied so the queue can be ordered by priority without joining to servers
+  # Copied so the queue can be ordered by priority without joining to servers. The server row stays locked until the
+  # transaction wrapping this insert commits so a concurrent priority change can't leave this message with a stale value.
   def copy_priority_from_server
-    self.priority = server.priority
+    server.with_lock { self.priority = server.priority }
   end
 
 end
