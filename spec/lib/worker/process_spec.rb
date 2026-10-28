@@ -5,6 +5,8 @@ require "rails_helper"
 module Worker
 
   RSpec.describe Process do
+    include ActiveSupport::Testing::TimeHelpers
+
     subject(:process) { described_class.new(thread_count: 1) }
 
     before do
@@ -23,6 +25,7 @@ module Worker
 
     describe "#run_task" do
       it "runs a task which is due and schedules its next run" do
+        travel_to Time.utc(2026, 1, 1, 10, 10)
         scheduled_task = ScheduledTask.create!(name: "PruneWebhookRequestsScheduledTask", next_run_after: 1.minute.ago)
         task = instance_double(PruneWebhookRequestsScheduledTask, call: nil)
         allow(PruneWebhookRequestsScheduledTask).to receive(:new).and_return(task)
@@ -30,7 +33,7 @@ module Worker
         process.send(:run_task, PruneWebhookRequestsScheduledTask)
 
         expect(task).to have_received(:call)
-        expect(scheduled_task.reload.next_run_after).to be > Time.current
+        expect(scheduled_task.reload.next_run_after).to eq Time.utc(2026, 1, 1, 10, 45)
       end
     end
   end
