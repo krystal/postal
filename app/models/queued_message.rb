@@ -73,7 +73,7 @@ class QueuedMessage < ApplicationRecord
       time = Time.now
       locker = Postal.locker_name
       # Lock by ID: an UPDATE scanning the priority index deadlocks with workers deleting finished messages
-      ids = self.class.ready.where(batch_key: batch_key, ip_address_id: ip_address_id, priority: priority, locked_by: nil, locked_at: nil).limit(limit).pluck(:id)
+      ids = self.class.ready.where(batch_key: batch_key, ip_address_id: ip_address_id, priority: priority.., locked_by: nil, locked_at: nil).limit(limit).pluck(:id)
       self.class.ready.where(id: ids, locked_by: nil, locked_at: nil).update_all(locked_by: locker, locked_at: time)
       QueuedMessage.where(batch_key: batch_key, ip_address_id: ip_address_id, locked_by: locker, locked_at: time).where.not(id: id)
     end
