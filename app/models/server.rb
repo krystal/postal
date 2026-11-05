@@ -311,7 +311,9 @@ class Server < ApplicationRecord
 
   # Messages queued while this runs may keep the old priority
   def copy_priority_to_queued_messages
-    queued_messages.where.not(priority: priority).in_batches(of: 1000).update_all(priority: priority)
+    queued_messages.where.not(priority: priority).in_batches(of: 1000) do |batch|
+      QueuedMessage.where(id: batch.ids).update_all(priority: priority)
+    end
   end
 
   class << self

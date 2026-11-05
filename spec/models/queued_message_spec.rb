@@ -233,8 +233,12 @@ RSpec.describe QueuedMessage do
           expect(queued_message.batchable_messages).to eq []
         end
 
-        it "does not find messages with a different priority" do
-          create(:queued_message, batch_key: batch_key, ip_address: nil, server: create(:server, priority: 100))
+        it "finds messages with a higher priority" do
+          other_message = create(:queued_message, batch_key: batch_key, ip_address: nil, server: create(:server, priority: 100))
+          expect(queued_message.batchable_messages).to eq [other_message]
+        end
+
+        it "does not find messages with a lower priority" do
           create(:queued_message, batch_key: batch_key, ip_address: nil, server: create(:server, priority: 0))
           expect(queued_message.batchable_messages).to eq []
         end
