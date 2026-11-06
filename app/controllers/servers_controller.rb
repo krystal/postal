@@ -47,6 +47,7 @@ class ServersController < ApplicationController
     if current_user.admin?
       extra_params += [
         :send_limit,
+        :priority,
         :allow_sender,
         :privacy_mode,
         :log_smtp_data,
