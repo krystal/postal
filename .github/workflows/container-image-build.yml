@@ -1,0 +1,154 @@
+---
+# A cut-down local copy of krystal/workflows' container-image-build.yml, which
+# identity and katapult call from their CI. Postal can't call that workflow:
+# krystal/postal is a public fork, and a public repository can't use a
+# reusable workflow stored in a private repository.
+#
+# It keeps the shared workflow's inputs, outputs and image tags for the parts
+# Postal uses, so ci.yml calls it the same way identity and katapult call the
+# shared one. If this repository becomes private, delete this file and point
+# ci.yml's build job at
+# krystal/workflows/.github/workflows/container-image-build.yml, pinned to a
+# commit as identity and katapult do.
+name: Container Image Build
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        type: string
+        description: >-
+          Image name to build, without a registry host or tag, such as
+          team/app. The workflow prefixes DEPOT_REGISTRY_HOST.
+        required: true
+      build_args:
+        type: string
+        description: "Docker build arguments, one KEY=VALUE per line."
+      build_target:
+        type: string
+        description: "Docker build target."
+
+    secrets:
+      DEPOT_REGISTRY_TOKEN:
+        description: >-
+          Depot token for DEPOT_REGISTRY_HOST, used to push the image.
+        required: true
+      DOCKER_HUB_PASSWORD:
+        description: >-
+          Docker Hub password or access token. Docker Hub login is skipped
+          when this is not provided.
+        required: false
+
+    outputs:
+      image_name:
+        description: >-
+          Name of the built image without a tag, including DEPOT_REGISTRY_HOST.
+        value: ${{ jobs.image.outputs.image_name }}
+      image:
+        description: "Image name and commit-<sha> tag of the built image."
+        value: ${{ jobs.image.outputs.image }}
+      version:
+        description: "Version of the image built, from git describe --tags."
+        value: ${{ jobs.image.outputs.version }}
+
+permissions:
+  contents: read
+  id-token: write # Authenticate to Depot with OIDC.
+
+jobs:
+  image:
+    name: Image
+    # identity and katapult run on depot-ubuntu-24.04. Every Krystal repository
+    # using those runners is private, and GitHub only gives public repositories
+    # an organization's self-hosted runners when the runner group allows it.
+    # The build itself still runs on Depot's builders.
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.info.outputs.image }}
+      image_name: ${{ steps.info.outputs.image_name }}
+      version: ${{ steps.info.outputs.version }}
+    env:
+      DEPOT_PROJECT_ID: ${{ vars.DEPOT_PROJECT_ID }}
+      DEPOT_REGISTRY_HOST: ${{ vars.DEPOT_REGISTRY_HOST }}
+      DOCKER_HUB_USERNAME: ${{ vars.DOCKER_HUB_USERNAME }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # git describe needs the tags for the version.
+          persist-credentials: false
+      - name: Work out image name, version and tags
+        id: info
+        env:
+          IMAGE_NAME: ${{ inputs.image_name }}
+          # Pass only whether the password is set, so it stays out of this
+          # step's environment.
+          DOCKER_HUB_PASSWORD_SET: ${{ secrets.DOCKER_HUB_PASSWORD != '' }}
+        run: |
+          if [[ -z "${DEPOT_PROJECT_ID}" || -z "${DEPOT_REGISTRY_HOST}" ]]; then
+            echo "The DEPOT_PROJECT_ID and DEPOT_REGISTRY_HOST variables must be" \
+              "available to this repository" >&2
+            exit 1
+          fi
+
+          # Docker Hub login is optional. DOCKER_HUB_USERNAME comes from a
+          # variable, so the password decides whether to log in.
+          docker_hub_login=false
+          if [[ "${DOCKER_HUB_PASSWORD_SET}" == "true" ]]; then
+            if [[ -z "${DOCKER_HUB_USERNAME}" ]]; then
+              echo "DOCKER_HUB_PASSWORD requires DOCKER_HUB_USERNAME" >&2
+              exit 1
+            fi
+            docker_hub_login=true
+          fi
+
+          image_name="${DEPOT_REGISTRY_HOST}/${IMAGE_NAME}"
+
+          # Docker tags allow [A-Za-z0-9_.-] up to 128 characters. Leave room
+          # for the branch- prefix.
+          ref_name="$(printf '%s' "${GITHUB_REF_NAME}" | LC_ALL=C sed -E \
+            's/[^A-Za-z0-9_]+/-/g; s/^-+//; s/-+$//')"
+          ref_name="${ref_name:0:121}"
+          ref_name="${ref_name%-}"
+          ref_name="${ref_name:-ref}"
+
+          version="$(git describe --tags --always)"
+          version="${version#v}"
+
+          {
+            echo "docker_hub_login=${docker_hub_login}"
+            echo "image_name=${image_name}"
+            echo "image=${image_name}:commit-${GITHUB_SHA}"
+            echo "version=${version}"
+            echo "tags<<EOF"
+            echo "${image_name}:commit-${GITHUB_SHA}"
+            if [[ "${GITHUB_REF}" == "refs/heads/main" ]]; then
+              echo "${image_name}:latest"
+              echo "${image_name}:main-${GITHUB_SHA}"
+            else
+              echo "${image_name}:branch-${ref_name}"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          cat "$GITHUB_OUTPUT"
+      - uses: depot/setup-action@15c09a5f77a0840ad4bce955686522a257853461 # v1.7.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        if: ${{ steps.info.outputs.docker_hub_login == 'true' }}
+        with:
+          username: ${{ vars.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_PASSWORD }}
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ vars.DEPOT_REGISTRY_HOST }}
+          # Depot Registry always uses x-token as the username.
+          username: x-token
+          password: ${{ secrets.DEPOT_REGISTRY_TOKEN }}
+      - uses: depot/build-push-action@5f3b3c2e5a00f0093de47f657aeaefcedff27d18 # v1.17.0
+        with:
+          project: ${{ vars.DEPOT_PROJECT_ID }}
+          context: .
+          push: true
+          tags: ${{ steps.info.outputs.tags }}
+          target: ${{ inputs.build_target }}
+          build-args: |
+            VERSION=${{ steps.info.outputs.version }}
+            ${{ inputs.build_args }}
