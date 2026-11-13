@@ -43,11 +43,14 @@ jobs:
     if: ${{ !contains(github.event.head_commit.message, '[skip test]') }}
     env:
       POSTAL_IMAGE: ${{ needs.build.outputs.image }}
+      # Steps can't read secrets in if:, so pass only whether it is set.
+      DOCKER_HUB_LOGIN: ${{ secrets.DOCKER_HUB_PASSWORD != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        if: ${{ env.DOCKER_HUB_LOGIN == 'true' }}
         with:
           username: ${{ vars.DOCKER_HUB_USERNAME }}
           password: ${{ secrets.DOCKER_HUB_PASSWORD }}
