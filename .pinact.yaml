@@ -1,0 +1,7 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/suzuki-shunsuke/pinact/main/json-schema/pinact.json
+version: 3
+
+# Only update to versions released at least 3 days ago, so a compromised
+# release has time to be spotted and pulled before we adopt it.
+min_age:
+  value: 3
