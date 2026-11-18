@@ -138,6 +138,15 @@ describe Server do
       server.update!(name: "Renamed Server")
       expect(queued_message.reload.priority).to eq 10
     end
+
+    it "copies the latest priority when it changes again before an earlier copy runs" do
+      queued_message = create(:queued_message, server: server)
+      earlier_save = Server.find(server.id)
+      earlier_save.priority = 80
+      Server.where(id: server.id).update_all(priority: 20)
+      earlier_save.send(:copy_priority_to_queued_messages)
+      expect(queued_message.reload.priority).to eq 20
+    end
   end
 
   describe "deletion" do
