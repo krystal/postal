@@ -7,11 +7,18 @@
 # It deletes queued messages, so only runs against a database named *test*.
 #
 #   POSTAL_CONFIG_FILE_PATH=config/postal/postal.test.yml RAILS_ENV=test \
-#     bundle exec ruby script/queue_claim_concurrency_check.rb [ours|level-update|upstream|pr3446|all]
+#     bundle exec ruby script/queue_claim_concurrency_check.rb [MODE[,MODE...]|all]
 #
-# level-update is one UPDATE ... ORDER BY id LIMIT 1 per priority level; upstream is the
-# claim before priorities; pr3446 is postalserver/postal#3446's claim.
-# Options: THREADS (8), MESSAGES (5000), DOMAINS (25), BATCH=0 to turn off batching.
+# ours is this branch's claim. single-update is the claim before priorities with
+# ORDER BY priority DESC, id ASC added, and level-update is one UPDATE ... ORDER BY id
+# LIMIT 1 per priority level; both batch with one UPDATE filtered on priority. skip-locked
+# finds the top level like ours, then locks with SELECT ... FOR UPDATE SKIP LOCKED
+# (MariaDB 10.6+, MySQL 8.0). upstream is the claim before priorities; pr3446 is
+# postalserver/postal#3446's claim.
+# Options: THREADS (8), MESSAGES (5000), DOMAINS (25), BATCH=0 to turn off batching,
+# DEFERRED_TOP=n to add n retrying messages at priority 100 ahead of the rest,
+# DESC_INDEX=1 to add a (priority DESC, id) index for the run, and
+# ISOLATION=READ-COMMITTED (or another level) for every connection.
 
 $stdout.sync = true
 
@@ -22,10 +29,17 @@ THREADS = (ENV["THREADS"] || 8).to_i
 MESSAGES = (ENV["MESSAGES"] || 5000).to_i
 DOMAINS = (ENV["DOMAINS"] || 25).to_i
 BATCH = ENV["BATCH"] != "0"
+DEFERRED_TOP = (ENV["DEFERRED_TOP"] || 0).to_i
+DESC_INDEX = ENV["DESC_INDEX"] == "1"
+ISOLATION = ENV.fetch("ISOLATION", nil)
 PRIORITIES = [100, 50, 0].freeze
 DECOYS_PER_KIND = 30
 MAX_RUN_TIME = 300
 PERMALINK = "queue-claim-check"
+
+if ISOLATION && !%w[READ-UNCOMMITTED READ-COMMITTED REPEATABLE-READ SERIALIZABLE].include?(ISOLATION)
+  abort "ISOLATION must be READ-UNCOMMITTED, READ-COMMITTED, REPEATABLE-READ or SERIALIZABLE"
+end
 
 # The batch lock as a single UPDATE, as upstream does it
 module SingleUpdateBatch
@@ -124,15 +138,62 @@ class PR3446Job < Worker::Jobs::ProcessQueuedMessagesJob
 
 end
 
+# The claim before priorities, with the priority added to its ORDER BY. The ascending
+# priority index can't serve this sort, so it sorts every candidate unless DESC_INDEX=1.
+class SingleUpdateJob < Worker::Jobs::ProcessQueuedMessagesJob
+
+  extend SingleUpdateBatch
+
+  def self.batch(message)
+    lock_batch(message, with_priority: true)
+  end
+
+  private
+
+  def lock_message_for_processing
+    QueuedMessage.where(ip_address_id: [nil, @ip_addresses])
+                 .where(locked_by: nil, locked_at: nil)
+                 .ready_with_delayed_retry
+                 .order(priority: :desc, id: :asc)
+                 .limit(1)
+                 .update_all(locked_by: @locker, locked_at: @lock_time)
+  end
+
+end
+
+# Finds the top level like ours, then locks the oldest message there that no other
+# transaction holds, with SELECT ... FOR UPDATE SKIP LOCKED.
+class SkipLockedJob < Worker::Jobs::ProcessQueuedMessagesJob
+
+  def self.batch(message)
+    message.batchable_messages(100).to_a
+  end
+
+  private
+
+  def lock_message_for_processing
+    priority = top_lockable_priority
+    return if priority.nil?
+
+    QueuedMessage.transaction do
+      id = lockable_messages.where(priority: priority).order(:id).limit(1).lock("FOR UPDATE SKIP LOCKED").pick(:id)
+      lock_message(id) if id
+    end
+  end
+
+end
+
 JOB_CLASSES = {
   "ours" => OursJob,
+  "single-update" => SingleUpdateJob,
   "level-update" => LevelUpdateJob,
+  "skip-locked" => SkipLockedJob,
   "upstream" => UpstreamJob,
   "pr3446" => PR3446Job
 }.freeze
 
-unless MODE == "all" || JOB_CLASSES.key?(MODE)
-  abort "usage: #{__FILE__} [#{JOB_CLASSES.keys.join('|')}|all]"
+unless MODE == "all" || MODE.split(",").all? { |mode| JOB_CLASSES.key?(mode) }
+  abort "usage: #{__FILE__} [#{JOB_CLASSES.keys.join('|')}[,...]|all]"
 end
 
 database = ActiveRecord::Base.connection.current_database
@@ -174,6 +235,8 @@ def statement_kind(sql)
     :unknown
   elsif sql.start_with?("UPDATE `queued_messages`") && sql.include?("`locked_by` = ")
     sql.include?("`batch_key` = ") || sql.include?("`queued_messages`.`id` IN (") ? :batch_lock : :claim
+  elsif sql.include?("SKIP LOCKED")
+    :skip_locked_select
   elsif sql.start_with?("SELECT DISTINCT `queued_messages`.`priority`")
     :priority_levels
   elsif sql.start_with?("SELECT `queued_messages`.`priority` FROM")
@@ -223,6 +286,10 @@ def seed
       priority: server.priority, attempts: 0, locked_by: nil, locked_at: nil, retry_after: nil,
       created_at: now, updated_at: now }.merge(extra)
   end
+
+  # Retrying messages at the top level, before everything else, as when a recipient's server is down
+  Array.new(DEFERRED_TOP) { |i| row.call(servers.first, i, attempts: 1, retry_after: 1.hour.from_now) }
+       .each_slice(1000) { |slice| QueuedMessage.insert_all!(slice) }
 
   # Messages which must never be claimed go first, so every claim skips them
   decoys = servers.flat_map do |server|
@@ -279,6 +346,17 @@ def print_explains(mode, statements)
   end
 end
 
+def apply_isolation(connection)
+  connection.execute("SET SESSION TRANSACTION ISOLATION LEVEL #{ISOLATION.tr('-', ' ')}") if ISOLATION
+end
+
+# MySQL 8.0 removed @@tx_isolation, and MariaDB only added @@transaction_isolation in 11.1
+def isolation_level
+  ActiveRecord::Base.connection.select_value("SELECT @@transaction_isolation")
+rescue ActiveRecord::StatementInvalid
+  ActiveRecord::Base.connection.select_value("SELECT @@tx_isolation")
+end
+
 def innodb_status
   rows = ActiveRecord::Base.connection.select_rows("SHOW GLOBAL STATUS WHERE Variable_name IN ('Innodb_deadlocks', 'Innodb_row_lock_waits', 'Innodb_row_lock_time')")
   rows.to_h.transform_values(&:to_i)
@@ -303,7 +381,8 @@ def run_threads(job_class, claimable_scope)
     Thread.new do
       Thread.current[:index] = index
       Thread.current[:job_class] = job_class
-      ActiveRecord::Base.connection_pool.with_connection do
+      ActiveRecord::Base.connection_pool.with_connection do |connection|
+        apply_isolation(connection)
         loop do
           raise "Timed out after #{MAX_RUN_TIME} seconds" if Time.now > deadline
 
@@ -397,7 +476,7 @@ def check(mode)
   failures << "locked or retrying messages taken" if unexpected.any?
   failures << "errors" if errors.any?
   failures << "locks taken over" if stolen.positive?
-  if %w[ours level-update].include?(mode)
+  if %w[ours single-update level-update skip-locked].include?(mode)
     failures << "priority inversions" if inversions.values.any? { |count| count > THREADS }
     failures << "batches mixing priorities" if mixed_batches.positive?
   end
@@ -408,12 +487,19 @@ ensure
 end
 
 Postal.change_database_connection_pool_size(THREADS + 3)
-ActiveRecord::Base.connection.select_one("SELECT @@version AS version, @@tx_isolation AS isolation").then do |row|
-  puts "Database: #{ActiveRecord::Base.connection.current_database} on #{row['version']}, #{row['isolation']}"
-end
+apply_isolation(ActiveRecord::Base.connection)
+version = ActiveRecord::Base.connection.select_value("SELECT @@version")
+puts "Database: #{ActiveRecord::Base.connection.current_database} on #{version}, #{isolation_level}"
 
-modes = MODE == "all" ? JOB_CLASSES.keys : [MODE]
-results = modes.to_h { |mode| [mode, check(mode)] }
+DESC_INDEX_NAME = "index_queued_messages_on_priority_desc_id"
+ActiveRecord::Base.connection.execute("ALTER TABLE queued_messages ADD INDEX #{DESC_INDEX_NAME} (priority DESC, id)") if DESC_INDEX
+
+modes = MODE == "all" ? JOB_CLASSES.keys : MODE.split(",")
+results = begin
+  modes.to_h { |mode| [mode, check(mode)] }
+ensure
+  ActiveRecord::Base.connection.execute("ALTER TABLE queued_messages DROP INDEX #{DESC_INDEX_NAME}") if DESC_INDEX
+end
 puts
 puts "Summary: #{results.map { |mode, passed| "#{mode} #{passed ? 'PASS' : 'FAIL'}" }.join(', ')}"
 exit(results.values.all? ? 0 : 1)
