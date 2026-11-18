@@ -37,9 +37,9 @@ module Postal
 
       # Copy unexpired suppressions from another list. An existing suppression for the same
       # type and address is only extended if the copied one expires later, so it is safe to re-run.
-      def copy_from(other)
+      def copy_from(other, batch_size: 1000)
         counts = { added: 0, extended: 0, unchanged: 0 }
-        other.unexpired.each do |suppression|
+        other.each_unexpired(batch_size: batch_size) do |suppression|
           existing = @database.select("suppressions", where: { type: suppression["type"], address: suppression["address"] }, limit: 1).first
           if existing.nil?
             @database.insert("suppressions", suppression.slice("type", "address", "reason", "timestamp", "keep_until"))
@@ -54,8 +54,18 @@ module Postal
         counts
       end
 
-      def unexpired
-        @database.select("suppressions", where: { keep_until: { greater_than_or_equal_to: Time.now.to_f } }, order: :id)
+      # Yields unexpired suppressions in ID order, a batch at a time, so a large list isn't loaded at once
+      def each_unexpired(batch_size: 1000, &block)
+        now = Time.now.to_f
+        last_id = 0
+        loop do
+          batch = @database.select("suppressions", where: { keep_until: { greater_than_or_equal_to: now }, id: { greater_than: last_id } },
+                                                   order: :id, limit: batch_size)
+          break if batch.empty?
+
+          batch.each(&block)
+          last_id = batch.last["id"]
+        end
       end
 
     end

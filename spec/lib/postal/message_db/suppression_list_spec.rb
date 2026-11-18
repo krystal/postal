@@ -15,11 +15,14 @@ describe Postal::MessageDB::SuppressionList do
     database.select("suppressions", order: :id).map { |s| s.except("id") }
   end
 
-  describe "#unexpired" do
-    it "returns suppressions which have not expired" do
+  describe "#each_unexpired" do
+    it "yields suppressions which have not expired, across batches" do
       insert_suppression(database, "recipient", "current@example.com", keep_until: 1.day.from_now.to_i)
       insert_suppression(database, "recipient", "expired@example.com", keep_until: 1.day.ago.to_i)
-      expect(suppression_list.unexpired.map { |s| s["address"] }).to eq ["current@example.com"]
+      insert_suppression(database, "recipient", "later@example.com", keep_until: 2.days.from_now.to_i)
+      addresses = []
+      suppression_list.each_unexpired(batch_size: 1) { |s| addresses << s["address"] }
+      expect(addresses).to eq ["current@example.com", "later@example.com"]
     end
   end
 
