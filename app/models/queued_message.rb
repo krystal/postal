@@ -81,11 +81,10 @@ class QueuedMessage < ApplicationRecord
 
   private
 
-  # Copied so the queue can be ordered by priority without joining to servers. The server row is share-locked until the
-  # transaction wrapping this insert commits so a concurrent priority change can't leave this message with a stale value,
-  # while concurrent inserts for the same server don't block each other.
+  # Copied so the queue can be ordered by priority without joining to servers. A message queued while the server's
+  # priority changes can keep the old value. Locking the server row here would close that gap but contend with the
+  # update check_send_limits makes to the same row for every outgoing message.
   def copy_priority_from_server
-    server.lock!("LOCK IN SHARE MODE")
     self.priority = server.priority
   end
 
