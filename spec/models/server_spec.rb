@@ -147,6 +147,27 @@ describe Server do
       earlier_save.send(:copy_priority_to_queued_messages)
       expect(queued_message.reload.priority).to eq 20
     end
+
+    it "does not leave an earlier copy's priority behind when a newer one is saved while it runs" do
+      queued_message = create(:queued_message, server: server)
+      Server.where(id: server.id).update_all(priority: 80)
+      earlier_save = Server.find(server.id)
+
+      # A save to 20, and its copy, land after the earlier copy has read 80 but before it writes it
+      later_save_done = false
+      allow(Server.lease_connection).to receive(:update).and_wrap_original do |update, *args, **kwargs|
+        unless later_save_done
+          later_save_done = true
+          Server.where(id: server.id).update_all(priority: 20)
+          Server.find(server.id).send(:copy_priority_to_queued_messages)
+        end
+        update.call(*args, **kwargs)
+      end
+
+      earlier_save.send(:copy_priority_to_queued_messages)
+      expect(later_save_done).to be true
+      expect(queued_message.reload.priority).to eq 20
+    end
   end
 
   describe "deletion" do

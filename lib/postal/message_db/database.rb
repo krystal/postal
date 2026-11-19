@@ -214,12 +214,9 @@ module Postal
         sql_query = "UPDATE #{escape_identifier(database_name)}.#{escape_identifier(table)} SET"
         sql_query << " #{hash_to_sql(attributes)}"
         if options[:where]
-          sql_query << (" " + build_where_string(options[:where]))
+          sql_query << (" " + build_where_string(options[:where], " AND "))
         end
-        with_mysql do |mysql|
-          query_on_connection(mysql, sql_query)
-          mysql.affected_rows
-        end
+        query_for_affected_rows(sql_query)
       end
 
       #
@@ -262,10 +259,7 @@ module Postal
       def delete(table, options = {})
         sql_query = "DELETE FROM #{escape_identifier(database_name)}.#{escape_identifier(table)}"
         sql_query << (" " + build_where_string(options[:where], " AND "))
-        with_mysql do |mysql|
-          query_on_connection(mysql, sql_query)
-          mysql.affected_rows
-        end
+        query_for_affected_rows(sql_query)
       end
 
       #
@@ -321,9 +315,20 @@ module Postal
 
       private
 
+      # Runs a write and returns its affected row count. The count has to be read before a slow query's EXPLAIN runs
+      # on the same connection, because that overwrites it.
+      def query_for_affected_rows(query)
+        with_mysql do |mysql|
+          affected_rows = nil
+          query_on_connection(mysql, query) { affected_rows = mysql.affected_rows }
+          affected_rows
+        end
+      end
+
       def query_on_connection(connection, query)
         start_time = Time.now.to_f
         result = connection.query(query, cast_booleans: true)
+        yield if block_given?
         time = Time.now.to_f - start_time
         logger.debug "  \e[4;34mMessageDB Query (#{time.round(2)}s) \e[0m  \e[33m#{query}\e[0m"
         if time > 0.05 && query =~ /\A(SELECT|UPDATE|DELETE) /

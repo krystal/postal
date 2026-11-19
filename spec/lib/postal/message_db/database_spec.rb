@@ -63,6 +63,34 @@ describe Postal::MessageDB::Database do
       end
     end
 
+    describe "affected row counts" do
+      # A query slower than 50ms is followed by an EXPLAIN on the same connection, which
+      # must not change the count that update and delete return.
+      def with_slow_queries
+        clock = Time.now.to_f
+        allow(Time).to receive(:now) { Time.at(clock += 1) }
+      end
+
+      before do
+        3.times { |i| database.insert("suppressions", { type: "recipient", address: "a#{i}@example.com", reason: "x", timestamp: 1, keep_until: 1 }) }
+      end
+
+      it "returns the number of rows a slow update changed" do
+        with_slow_queries
+        expect(database.update("suppressions", { reason: "y" }, where: { keep_until: 1 })).to eq 3
+      end
+
+      it "returns 0 for a slow update that changed nothing" do
+        with_slow_queries
+        expect(database.update("suppressions", { reason: "y" }, where: { keep_until: 2 })).to eq 0
+      end
+
+      it "returns the number of rows a slow delete removed" do
+        with_slow_queries
+        expect(database.delete("suppressions", where: { keep_until: 1 })).to eq 3
+      end
+    end
+
     describe "#select with a hostile condition key" do
       # End-to-end proof against the live test database: the injected key is
       # treated as a single (non-existent) column identifier, so MySQL rejects

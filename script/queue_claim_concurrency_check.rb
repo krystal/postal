@@ -4,10 +4,15 @@
 # Runs ProcessQueuedMessagesJob from several threads against seeded queued messages
 # (priorities 100/50/0) and checks each is claimed once, in priority order, without
 # deadlocks. Sending is replaced by batching and deleting, as a successful send does.
-# It deletes queued messages, so only runs against a database named *test*.
+# It deletes queued messages, so it only runs in the test environment against a
+# database named *test*. Nothing else may write queued_messages in that database while
+# it runs: it takes and deletes any ready message.
 #
-#   POSTAL_CONFIG_FILE_PATH=config/postal/postal.test.yml RAILS_ENV=test \
+#   POSTAL_CONFIG_FILE_PATH=config/postal/postal.test.yml \
 #     bundle exec ruby script/queue_claim_concurrency_check.rb [MODE[,MODE...]|all]
+#
+# The config must set rails.environment: test, as config/examples/test.yml does, or run
+# with RAILS_ENVIRONMENT=test. config/boot.rb replaces RAILS_ENV with that setting.
 #
 # ours is this branch's claim. single-update is the claim before priorities with
 # ORDER BY priority DESC, id ASC added, and level-update is one UPDATE ... ORDER BY id
@@ -197,8 +202,15 @@ unless MODE == "all" || MODE.split(",").all? { |mode| JOB_CLASSES.key?(mode) }
 end
 
 database = ActiveRecord::Base.connection.current_database
-unless database.include?("test")
-  abort "Refusing to run against '#{database}': this script deletes queued messages, so it only runs against a test database"
+unless Rails.env.test? && database.include?("test")
+  abort "Refusing to run in #{Rails.env} against '#{database}': this script deletes queued messages, so it only runs in the " \
+        "test environment (rails.environment: test or RAILS_ENVIRONMENT=test) against a test database"
+end
+
+# Only ours and skip-locked apply the minimum, so other modes would claim rows they leave behind
+if Postal::Config.worker.minimum_priority > PRIORITIES.min
+  abort "worker.minimum_priority is #{Postal::Config.worker.minimum_priority}, but only ours and skip-locked apply it; " \
+        "unset WORKER_MINIMUM_PRIORITY (or set it to #{PRIORITIES.min} or lower)"
 end
 
 # Counts rows each thread's UPDATEs lock, to compare with the messages it processes
@@ -219,11 +231,14 @@ ActiveRecord::Relation.prepend(LockCounter)
 RECORDS = Concurrent::Array.new
 RECORDS_MUTEX = Mutex.new
 MessageDequeuer.define_singleton_method(:process) do |message, **|
+  claimed_by = Time.current # the claim has committed by now
   batch = BATCH ? Thread.current[:job_class].batch(message) : []
   RECORDS_MUTEX.synchronize do
-    RECORDS << { seq: RECORDS.size, id: message.id, priority: message.priority, head: true, thread: Thread.current[:index] }
+    RECORDS << { id: message.id, priority: message.priority, head: true, thread: Thread.current[:index],
+                 locked_at: message.locked_at, claimed_by: claimed_by }
     batch.each do |other|
-      RECORDS << { seq: RECORDS.size, id: other.id, priority: other.priority, head: false, head_priority: message.priority, thread: Thread.current[:index] }
+      RECORDS << { id: other.id, priority: other.priority, head: false, head_priority: message.priority,
+                   thread: Thread.current[:index], locked_at: other.locked_at }
     end
   end
   Thread.current[:processed] += 1 + batch.size
@@ -234,7 +249,9 @@ def statement_kind(sql)
   if sql.nil?
     :unknown
   elsif sql.start_with?("UPDATE `queued_messages`") && sql.include?("`locked_by` = ")
-    sql.include?("`batch_key` = ") || sql.include?("`queued_messages`.`id` IN (") ? :batch_lock : :claim
+    # Every claim filters ip_address_id. Ours' batch lock is by id alone, and Rails renders
+    # one id as `id` = N and no ids as 1=0.
+    sql.include?("`batch_key` = ") || !sql.include?("`ip_address_id`") ? :batch_lock : :claim
   elsif sql.include?("SKIP LOCKED")
     :skip_locked_select
   elsif sql.start_with?("SELECT DISTINCT `queued_messages`.`priority`")
@@ -273,10 +290,13 @@ def clean_up
 end
 
 def seed
-  user = User.create!(first_name: "Queue", last_name: "Check", email_address: "#{PERMALINK}@example.com", password: SecureRandom.hex(16))
-  organization = Organization.create!(name: "Queue claim check", permalink: PERMALINK, owner: user)
-  servers = PRIORITIES.map do |priority|
-    Server.create!(organization: organization, name: "Priority #{priority}", mode: "Live", priority: priority, provision_database: false)
+  # One transaction, so a seed that fails part way can't leave a user that clean_up can't find
+  servers = ActiveRecord::Base.transaction do
+    user = User.create!(first_name: "Queue", last_name: "Check", email_address: "#{PERMALINK}@example.com", password: SecureRandom.hex(16))
+    organization = Organization.create!(name: "Queue claim check", permalink: PERMALINK, owner: user)
+    PRIORITIES.map do |priority|
+      Server.create!(organization: organization, name: "Priority #{priority}", mode: "Live", priority: priority, provision_database: false)
+    end
   end
 
   now = Time.current
@@ -320,7 +340,7 @@ def capture_claim_sql(job_class)
     job.send(:find_ip_addresses)
     job.send(:lock_message_for_processing)
     message = QueuedMessage.find_by(locked_by: "capture")
-    job_class.batch(message) if message
+    job_class.batch(message) if message && BATCH
     raise ActiveRecord::Rollback
   end
   statements
@@ -369,6 +389,8 @@ def latest_deadlock
   return [] if section.nil?
 
   section.lines.grep(/\A(UPDATE|DELETE|SELECT|INSERT|RECORD LOCKS|\*\*\* )/).map { |line| line.strip[0, 160] }
+rescue ActiveRecord::StatementInvalid => e # e.g. without the PROCESS privilege
+  ["unavailable (#{e.message.lines.first.strip})"]
 end
 
 def run_threads(job_class, claimable_scope)
@@ -445,10 +467,11 @@ def check(mode)
   heads = RECORDS.select { |r| r[:head] }
   mixed_batches = RECORDS.count { |r| !r[:head] && r[:priority] != r[:head_priority] }
 
-  # A lower priority claim before the last higher priority claim (batched messages not counted)
+  # Lower priority claims that committed before the last higher priority message's lock time was taken, so while that
+  # message was ready. locked_at is taken before each lock, so claims overlapping it aren't counted.
   inversions = PRIORITIES.each_cons(2).to_h do |higher, lower|
-    last_higher = heads.select { |r| r[:priority] >= higher }.map { |r| r[:seq] }.max || -1
-    ["#{lower} before last #{higher}", heads.count { |r| r[:priority] <= lower && r[:seq] < last_higher }]
+    last_higher = RECORDS.select { |r| r[:priority] >= higher }.map { |r| r[:locked_at] }.max
+    ["#{lower} before last #{higher}", last_higher ? heads.count { |r| r[:priority] <= lower && r[:claimed_by] < last_higher } : 0]
   end
 
   puts "Results (#{mode}):"
@@ -477,7 +500,7 @@ def check(mode)
   failures << "errors" if errors.any?
   failures << "locks taken over" if stolen.positive?
   if %w[ours single-update level-update skip-locked].include?(mode)
-    failures << "priority inversions" if inversions.values.any? { |count| count > THREADS }
+    failures << "priority inversions" if inversions.values.any?(&:positive?)
     failures << "batches mixing priorities" if mixed_batches.positive?
   end
   puts "  verdict:                  #{failures.empty? ? 'PASS' : "FAIL (#{failures.join(', ')})"}"
@@ -488,6 +511,13 @@ end
 
 Postal.change_database_connection_pool_size(THREADS + 3)
 apply_isolation(ActiveRecord::Base.connection)
+
+# Two runs against one database would clean up and take each other's messages. Taken after
+# the pool is resized, which disconnects, so this session keeps the lock until the script exits.
+lock_name = ActiveRecord::Base.connection.quote("#{ActiveRecord::Base.connection.current_database}:#{PERMALINK}")
+unless ActiveRecord::Base.connection.select_value("SELECT GET_LOCK(#{lock_name}, 0)") == 1
+  abort "Another queue claim check is running against '#{ActiveRecord::Base.connection.current_database}'"
+end
 version = ActiveRecord::Base.connection.select_value("SELECT @@version")
 puts "Database: #{ActiveRecord::Base.connection.current_database} on #{version}, #{isolation_level}"
 

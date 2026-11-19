@@ -76,17 +76,70 @@ describe Postal::MessageDB::SuppressionList do
       expect(suppressions(database).map { |s| s["type"] }).to eq %w[recipient sender]
     end
 
+    # Runs the block once, straight after copy_from looks up the destination suppression
+    def after_lookup(database)
+      ran = false
+      allow(database).to receive(:select).and_wrap_original do |original, *args|
+        original.call(*args).tap do
+          next if ran || args[1].nil? || args[1].dig(:where, :type).nil?
+
+          ran = true
+          yield
+        end
+      end
+    end
+
     context "when the destination already has a suppression which expires sooner" do
-      it "extends the existing suppression" do
+      it "extends the existing suppression, leaving one of another type for the same address alone" do
         existing_timestamp = 5.days.ago.to_i
         later_keep_until = 30.days.from_now.to_i
+        sender_keep_until = 3.days.from_now.to_i
+        insert_suppression(database, "sender", "user@example.com", reason: "sender reason", timestamp: existing_timestamp, keep_until: sender_keep_until)
         insert_suppression(database, "recipient", "user@example.com", reason: "soft fail", timestamp: existing_timestamp, keep_until: 5.days.from_now.to_i)
         insert_suppression(source_database, "recipient", "user@example.com", reason: "hard fail", keep_until: later_keep_until)
 
         expect(suppression_list.copy_from(source)).to eq({ added: 0, extended: 1, unchanged: 0 })
         expect(suppressions(database)).to eq [
+          { "type" => "sender", "address" => "user@example.com", "reason" => "sender reason", "timestamp" => existing_timestamp, "keep_until" => sender_keep_until },
           { "type" => "recipient", "address" => "user@example.com", "reason" => "hard fail", "timestamp" => existing_timestamp, "keep_until" => later_keep_until },
         ]
+      end
+    end
+
+    context "when the destination suppression has no expiry" do
+      it "sets the copied expiry" do
+        database.insert("suppressions", { type: "recipient", address: "user@example.com", reason: "manual", timestamp: 1.day.ago.to_i, keep_until: nil })
+        source_keep_until = 20.days.from_now.to_i
+        insert_suppression(source_database, "recipient", "user@example.com", reason: nil, keep_until: source_keep_until)
+
+        expect(suppression_list.copy_from(source)).to eq({ added: 0, extended: 1, unchanged: 0 })
+        expect(suppressions(database).map { |s| [s["reason"], s["keep_until"]] }).to eq [["manual", source_keep_until]]
+      end
+    end
+
+    context "when the destination suppression is deleted after it is looked up" do
+      it "adds the copied suppression" do
+        insert_suppression(database, "recipient", "user@example.com", reason: "soft fail", keep_until: 1.day.ago.to_i)
+        source_keep_until = 20.days.from_now.to_i
+        insert_suppression(source_database, "recipient", "user@example.com", reason: "hard fail", keep_until: source_keep_until)
+        after_lookup(database) { suppression_list.prune }
+
+        expect(suppression_list.copy_from(source)).to eq({ added: 1, extended: 0, unchanged: 0 })
+        expect(suppressions(database).map { |s| [s["reason"], s["keep_until"]] }).to eq [["hard fail", source_keep_until]]
+      end
+    end
+
+    context "when the destination suppression is extended further after it is looked up" do
+      it "keeps the later expiry" do
+        insert_suppression(database, "recipient", "user@example.com", reason: "soft fail", keep_until: 5.days.from_now.to_i)
+        insert_suppression(source_database, "recipient", "user@example.com", reason: "hard fail", keep_until: 20.days.from_now.to_i)
+        concurrent_keep_until = 30.days.from_now.to_i
+        after_lookup(database) do
+          database.query("UPDATE `#{database.database_name}`.`suppressions` SET `keep_until` = #{concurrent_keep_until}, `reason` = 'too many hard fails'")
+        end
+
+        expect(suppression_list.copy_from(source)).to eq({ added: 0, extended: 0, unchanged: 1 })
+        expect(suppressions(database).map { |s| [s["reason"], s["keep_until"]] }).to eq [["too many hard fails", concurrent_keep_until]]
       end
     end
 

@@ -309,12 +309,18 @@ class Server < ApplicationRecord
     errors.add :ip_pool_id, "must belong to the organization"
   end
 
-  # Messages queued while this runs may keep the old priority. Each batch reads the current priority, so if it changes
-  # again before this finishes, the rows end at the latest value. Updates by ID only: filtering the UPDATE on server_id
-  # can lock through that index and deadlock with the DELETE that follows a send.
+  # Messages queued while this runs may keep the old priority. Each batch is re-checked after its update and redone if
+  # the priority changed meanwhile, so a copy that read an older priority can't be left behind after a newer one. This
+  # avoids locking the server row, which check_send_limits updates for every outgoing message. Updates by ID only:
+  # filtering the UPDATE on server_id can lock through that index and deadlock with the DELETE that follows a send.
   def copy_priority_to_queued_messages
     queued_messages.where.not(priority: priority).in_batches(of: 1000) do |batch|
-      QueuedMessage.where(id: batch.ids).update_all(priority: Server.where(id: id).pick(:priority))
+      ids = batch.ids
+      loop do
+        current = Server.where(id: id).pick(:priority)
+        QueuedMessage.where(id: ids).update_all(priority: current)
+        break if Server.where(id: id).pick(:priority) == current
+      end
     end
   end
 

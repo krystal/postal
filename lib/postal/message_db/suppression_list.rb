@@ -40,16 +40,7 @@ module Postal
       def copy_from(other, batch_size: 1000)
         counts = { added: 0, extended: 0, unchanged: 0 }
         other.each_unexpired(batch_size: batch_size) do |suppression|
-          existing = @database.select("suppressions", where: { type: suppression["type"], address: suppression["address"] }, limit: 1).first
-          if existing.nil?
-            @database.insert("suppressions", suppression.slice("type", "address", "reason", "timestamp", "keep_until"))
-            counts[:added] += 1
-          elsif existing["keep_until"].nil? || existing["keep_until"] < suppression["keep_until"]
-            @database.update("suppressions", { reason: suppression["reason"] || existing["reason"], keep_until: suppression["keep_until"] }, where: { id: existing["id"] })
-            counts[:extended] += 1
-          else
-            counts[:unchanged] += 1
-          end
+          counts[copy_suppression(suppression)] += 1
         end
         counts
       end
@@ -66,6 +57,29 @@ module Postal
           batch.each(&block)
           last_id = batch.last["id"]
         end
+      end
+
+      private
+
+      # Returns :added, :extended or :unchanged. The update only applies while the stored expiry is still earlier, so a
+      # later one written since the lookup is kept. If it updates nothing, the row was deleted (e.g. pruned) or extended
+      # in the meantime, so look it up again.
+      def copy_suppression(suppression)
+        3.times do
+          existing = @database.select("suppressions", where: { type: suppression["type"], address: suppression["address"] }, limit: 1).first
+          if existing.nil?
+            @database.insert("suppressions", suppression.slice("type", "address", "reason", "timestamp", "keep_until"))
+            return :added
+          end
+          return :unchanged unless existing["keep_until"].nil? || existing["keep_until"] < suppression["keep_until"]
+
+          where = { id: existing["id"] }
+          where[:keep_until] = { less_than: suppression["keep_until"] } unless existing["keep_until"].nil?
+          attributes = { keep_until: suppression["keep_until"] }
+          attributes[:reason] = suppression["reason"] if suppression["reason"]
+          return :extended if @database.update("suppressions", attributes, where: where).positive?
+        end
+        raise Postal::Error, "The suppression for #{suppression['address']} kept changing while it was being copied"
       end
 
     end
